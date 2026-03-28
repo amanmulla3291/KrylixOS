@@ -1,0 +1,41 @@
+# KrylixOS .gitignore
+
+# ── Key material — NEVER commit these ──────────────────────────────────────
+*.key
+*.pem
+*-private.asc
+*-private.gpg
+KrylixOS-mok.*
+KrylixOS-gpg-*
+.env.dev
+.env.local
+
+# ── Build artifacts ─────────────────────────────────────────────────────────
+*.rpm
+*.iso
+*.img
+SHA256SUMS
+SHA256SUMS.asc
+
+# Exception: GPG public key IS safe to commit
+!repo/RPM-GPG-KEY-KrylixOS
+!repo/RPM-GPG-KEY-KrylixOS-dev
+
+# ── rpmbuild tree ────────────────────────────────────────────────────────────
+rpmbuild/
+~/rpmbuild/
+
+# ── Lorax / ISO build output ─────────────────────────────────────────────────
+lorax-output/
+lorax-verify/
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+lorax.log
+
+# ── Editor / OS ──────────────────────────────────────────────────────────────
+.vscode/settings.json
+.DS_Store
+*~
+*.swp
+*.swo

@@ -1,0 +1,155 @@
+name: Build RPM Packages
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'packages/**'
+      - '.github/workflows/build-rpms.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# ── Signing key setup ────────────────────────────────────────────────────────
+# GitHub Secrets required (Settings → Secrets → Actions):
+#
+#   GPG_PRIVATE_KEY  — ASCII-armored GPG private key (export with gpg --armor --export-secret-keys)
+#   GPG_PASSPHRASE   — passphrase for the GPG key (can be empty string if key has no passphrase)
+#   GPG_KEY_ID       — long key ID or email used to identify signing key
+#
+# Generate with:
+#   gpg --full-gen-key           (RSA 4096, no expiry, or short expiry)
+#   gpg --armor --export-secret-keys YOUR_KEY_ID  → paste as GPG_PRIVATE_KEY
+#   gpg --armor --export YOUR_KEY_ID              → becomes repo/RPM-GPG-KEY-KrylixOS
+# ─────────────────────────────────────────────────────────────────────────────
+
+jobs:
+  build-rpms:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build tools
+        run: |
+          dnf install -y \
+            rpm-build rpmsign rpmdevtools \
+            selinux-policy-devel checkpolicy policycoreutils \
+            dnf5 dnf5-plugins \
+            gpg curl jq make
+
+      - name: Set SOURCE_DATE_EPOCH
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "${GITHUB_ENV}"
+
+      - name: Set up rpmbuild tree
+        run: rpmdev-setuptree
+
+      - name: Import GPG signing key
+        run: |
+          if [[ -z "${{ secrets.GPG_PRIVATE_KEY }}" ]]; then
+            echo "⚠  GPG_PRIVATE_KEY not set — generating ephemeral dev key"
+            gpg --batch --gen-key <<EOF
+          Key-Type: RSA
+          Key-Length: 4096
+          Name-Real: KrylixOS CI Build
+          Name-Email: ci@krylix.local
+          Expire-Date: 1d
+          %no-passphrase
+          %commit
+          EOF
+          else
+            printf '%s' "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          fi
+          # Write key ID to env for later steps
+          GPG_KEY_ID=$(gpg --list-keys --with-colons 2>/dev/null | \
+            grep '^pub' | head -1 | cut -d: -f5)
+          echo "GPG_KEY_ID=${GPG_KEY_ID}" >> "${GITHUB_ENV}"
+          echo "GPG key ready: ${GPG_KEY_ID}"
+
+      - name: Configure rpmmacros for signing
+        run: |
+          cat > ~/.rpmmacros << EOF
+          %_topdir        %(echo \$HOME)/rpmbuild
+          %_gpg_name      ${{ env.GPG_KEY_ID }}
+          EOF
+
+      # ── Gap 1 fix: build SELinux policy RPM FIRST ──
+      - name: Build selinux-krylix-policy RPM (Gap 1 — must be first)
+        run: |
+          cp packages/falco.te ~/rpmbuild/SOURCES/
+          rpmbuild -bb \
+            --define "_topdir ${HOME}/rpmbuild" \
+            --define "source_date_epoch ${SOURCE_DATE_EPOCH}" \
+            packages/selinux-krylix-policy.spec
+          echo "✓ selinux-krylix-policy RPM built (Gap 1 fix)"
+
+      - name: Build remaining RPMs
+        run: |
+          for spec in \
+            packages/krylix-release.spec \
+            packages/falco-rules-krylix.spec \
+            packages/suricata-rules-krylix.spec; do
+            echo "Building: ${spec}"
+            rpmbuild -bb \
+              --define "_topdir ${HOME}/rpmbuild" \
+              --define "source_date_epoch ${SOURCE_DATE_EPOCH}" \
+              "${spec}"
+          done
+
+      - name: Sign all RPMs
+        run: |
+          PASSPHRASE="${{ secrets.GPG_PASSPHRASE }}"
+          find ~/rpmbuild/RPMS -name "*.rpm" | while read -r rpm; do
+            echo "Signing: ${rpm##*/}"
+            echo "${PASSPHRASE}" | rpmsign \
+              --define "_gpg_name ${{ env.GPG_KEY_ID }}" \
+              --addsign \
+              "${rpm}" 2>/dev/null || \
+            rpmsign \
+              --define "_gpg_name ${{ env.GPG_KEY_ID }}" \
+              --define "__gpg_check_password_cmd /bin/true" \
+              --addsign \
+              "${rpm}"
+          done
+          echo "✓ All RPMs signed"
+
+      - name: Verify RPM signatures
+        run: |
+          gpg --export > /tmp/krylix-pub.gpg
+          rpm --import /tmp/krylix-pub.gpg
+          FAILURES=0
+          find ~/rpmbuild/RPMS -name "*.rpm" | while read -r rpm; do
+            if rpm --checksig "${rpm}" 2>&1 | grep -q "digests signatures OK"; then
+              echo "  ✓ ${rpm##*/}"
+            else
+              echo "  ✗ FAILED: ${rpm##*/}"
+              FAILURES=$((FAILURES+1))
+            fi
+          done
+          [[ "${FAILURES}" -eq 0 ]] || { echo "RPM signature verification failed"; exit 1; }
+
+      - name: Export GPG public key as artifact
+        run: |
+          gpg --armor --export "${{ env.GPG_KEY_ID }}" > /tmp/RPM-GPG-KEY-KrylixOS
+          echo "✓ Public key exported"
+
+      - name: Upload RPM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: krylix-rpms
+          path: ~/rpmbuild/RPMS/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload GPG public key artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: krylix-gpg-pubkey
+          path: /tmp/RPM-GPG-KEY-KrylixOS
+          retention-days: 14

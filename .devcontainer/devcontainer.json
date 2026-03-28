@@ -1,0 +1,25 @@
+{
+  "name": "KrylixOS Build Environment",
+  "image": "fedora:41",
+
+  "remoteUser": "root",
+
+  "postCreateCommand": "bash .devcontainer/setup.sh",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "timonwong.shellcheck",
+        "foxundermoon.shell-format",
+        "redhat.vscode-yaml",
+        "ms-vscode.makefile-tools"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "files.eol": "\n",
+        "editor.tabSize": 4,
+        "shellcheck.enable": true
+      }
+    }
+  }
+}

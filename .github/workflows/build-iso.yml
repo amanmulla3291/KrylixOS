@@ -1,0 +1,133 @@
+name: Build ISO
+
+on:
+  workflow_run:
+    workflows: [ "Build Kernel", "Build RPM Packages" ]
+    types: [ completed ]
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-iso:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+      options: --privileged   # lorax needs loop devices
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install ISO build tools
+        run: |
+          dnf install -y \
+            lorax anaconda-core pykickstart \
+            dnf5 dnf5-plugins \
+            gpg curl jq createrepo_c \
+            genisoimage isomd5sum
+
+          # mkksiso ships in lorax-lmc-novirt on Fedora 43
+          dnf install -y lorax-lmc-novirt 2>/dev/null || true
+
+      - name: Set SOURCE_DATE_EPOCH (reproducible)
+        run: |
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "${GITHUB_ENV}"
+          echo "BUILD_DATE=$(date -u -d @$(git log -1 --format=%ct) '+%Y%m%d')" >> "${GITHUB_ENV}"
+
+      - name: Download RPM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: krylix-rpms
+          path: /tmp/krylix-rpms/
+
+      - name: Download kernel RPM
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-krylix-rpm
+          path: /tmp/krylix-rpms/x86_64/
+        continue-on-error: true
+
+      - name: Download GPG public key
+        uses: actions/download-artifact@v4
+        with:
+          name: krylix-gpg-pubkey
+          path: /tmp/
+        continue-on-error: true
+
+      - name: Import GPG key for ISO signing
+        run: |
+          if [[ -z "${{ secrets.GPG_PRIVATE_KEY }}" ]]; then
+            echo "⚠  GPG_PRIVATE_KEY not set — generating ephemeral key for ISO signing"
+            gpg --batch --gen-key <<EOF
+          Key-Type: RSA
+          Key-Length: 4096
+          Name-Real: KrylixOS ISO Sign
+          Name-Email: iso@krylix.local
+          Expire-Date: 1d
+          %no-passphrase
+          %commit
+          EOF
+          else
+            printf '%s' "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          fi
+          echo "GPG_KEY_ID=$(gpg --list-keys --with-colons | grep '^pub' | head -1 | cut -d: -f5)" \
+            >> "${GITHUB_ENV}"
+
+      - name: Validate Kickstart
+        run: |
+          ksvalidator iso/ks.cfg && echo "✓ Kickstart valid" || {
+            echo "✗ Kickstart validation failed — check iso/ks.cfg"
+            exit 1
+          }
+
+      - name: Build ISO with lorax
+        run: |
+          ISO_NAME="KrylixOS-1.2-x86_64-${{ env.BUILD_DATE }}.iso"
+          echo "ISO_NAME=${ISO_NAME}" >> "${GITHUB_ENV}"
+
+          lorax \
+            --product "KrylixOS Linux" \
+            --version "1.2" \
+            --release "${{ env.BUILD_DATE }}" \
+            --source "https://dl.fedoraproject.org/pub/fedora/linux/releases/43/Everything/x86_64/os/" \
+            --source "file:///tmp/krylix-rpms/" \
+            --logfile /tmp/lorax.log \
+            --rootfs-size 4 \
+            /tmp/lorax-output/ 2>&1 | tail -20
+
+          if command -v mkksiso &>/dev/null; then
+            mkksiso --ks iso/ks.cfg \
+              /tmp/lorax-output/images/boot.iso \
+              "/tmp/${ISO_NAME}"
+          else
+            cp /tmp/lorax-output/images/boot.iso "/tmp/${ISO_NAME}"
+            echo "⚠  mkksiso not available — Kickstart not embedded in ISO"
+          fi
+          echo "✓ ISO built: ${ISO_NAME}"
+        env:
+          SOURCE_DATE_EPOCH: ${{ env.SOURCE_DATE_EPOCH }}
+
+      - name: Generate SHA256 + GPG signature
+        run: |
+          cd /tmp
+          sha256sum "${{ env.ISO_NAME }}" > SHA256SUMS
+          gpg --batch --yes --detach-sign --armor SHA256SUMS
+          echo "SHA256SUMS:"
+          cat SHA256SUMS
+
+      - name: Upload ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: krylix-iso-${{ env.BUILD_DATE }}
+          path: |
+            /tmp/${{ env.ISO_NAME }}
+            /tmp/SHA256SUMS
+            /tmp/SHA256SUMS.asc
+          retention-days: 30
+          if-no-files-found: warn

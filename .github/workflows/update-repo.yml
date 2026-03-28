@@ -1,0 +1,166 @@
+name: Update DNF Repository
+
+on:
+  workflow_run:
+    workflows: [ "Build RPM Packages", "Build Kernel" ]
+    types: [ completed ]
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # push to gh-pages
+
+jobs:
+  update-repo:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install tools
+        run: dnf install -y createrepo_c gpg git curl
+
+      - name: Configure git
+        run: |
+          git config --global user.name  "KrylixOS Build Bot"
+          git config --global user.email "build@krylix.github.io"
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      - name: Download new RPMs
+        uses: actions/download-artifact@v4
+        with:
+          name: krylix-rpms
+          path: /tmp/new-rpms/
+
+      - name: Download kernel RPM
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-krylix-rpm
+          path: /tmp/new-rpms/x86_64/
+        continue-on-error: true
+
+      - name: Download GPG public key
+        uses: actions/download-artifact@v4
+        with:
+          name: krylix-gpg-pubkey
+          path: /tmp/
+        continue-on-error: true
+
+      - name: Import GPG key for repomd.xml signing
+        run: |
+          if [[ -n "${{ secrets.GPG_PRIVATE_KEY }}" ]]; then
+            printf '%s' "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          else
+            gpg --batch --gen-key <<EOF
+          Key-Type: RSA
+          Key-Length: 4096
+          Name-Real: KrylixOS Repo Sign
+          Name-Email: repo@krylix.local
+          Expire-Date: 1d
+          %no-passphrase
+          %commit
+          EOF
+          fi
+          echo "GPG_KEY_ID=$(gpg --list-keys --with-colons | grep '^pub' | head -1 | cut -d: -f5)" \
+            >> "${GITHUB_ENV}"
+
+      - name: Checkout or create gh-pages branch
+        run: |
+          git fetch origin gh-pages 2>/dev/null || true
+          if git show-ref --verify --quiet refs/remotes/origin/gh-pages; then
+            git checkout gh-pages
+          else
+            git checkout --orphan gh-pages
+            git rm -rf . 2>/dev/null || true
+            mkdir -p repo
+          fi
+
+      - name: Copy new RPMs to repo/
+        run: |
+          mkdir -p repo/
+          find /tmp/new-rpms -name "*.rpm" -exec cp {} repo/ \;
+          echo "RPMs in repo/:"
+          ls -lh repo/*.rpm 2>/dev/null | wc -l
+
+      - name: Prune old kernel RPMs (keep last 3 — 1 GB Pages limit)
+        run: |
+          cd repo/
+          mapfile -t KERNEL_RPMS < <(ls -t kernel-krylix-*.rpm 2>/dev/null || true)
+          KEEP=3
+          for i in "${!KERNEL_RPMS[@]}"; do
+            if [[ "${i}" -ge "${KEEP}" ]]; then
+              echo "Pruning: ${KERNEL_RPMS[$i]}"
+              rm -f "${KERNEL_RPMS[$i]}"
+            fi
+          done
+          echo "Repo size: $(du -sh . | cut -f1)"
+
+      - name: Update GPG public key in repo
+        run: |
+          if [[ -f /tmp/RPM-GPG-KEY-KrylixOS ]]; then
+            cp /tmp/RPM-GPG-KEY-KrylixOS repo/RPM-GPG-KEY-KrylixOS
+          else
+            gpg --armor --export "${{ env.GPG_KEY_ID }}" > repo/RPM-GPG-KEY-KrylixOS
+          fi
+
+      - name: Regenerate repodata
+        run: |
+          createrepo_c --update --checksum=sha256 repo/
+          echo "✓ repodata regenerated"
+
+      - name: Sign repomd.xml (required for repo_gpgcheck=1)
+        run: |
+          PASSPHRASE="${{ secrets.GPG_PASSPHRASE }}"
+          cd repo/repodata/
+          if [[ -n "${PASSPHRASE}" ]]; then
+            echo "${PASSPHRASE}" | gpg \
+              --batch --yes --passphrase-fd 0 \
+              --pinentry-mode loopback \
+              --default-key "${{ env.GPG_KEY_ID }}" \
+              --detach-sign --armor repomd.xml
+          else
+            gpg \
+              --batch --yes \
+              --default-key "${{ env.GPG_KEY_ID }}" \
+              --detach-sign --armor repomd.xml
+          fi
+          echo "✓ repomd.xml signed (repo_gpgcheck=1 consumers will verify)"
+
+      - name: Verify repo size < 800 MB
+        run: |
+          SIZE_MB=$(du -sm repo/ | cut -f1)
+          echo "Repo size: ${SIZE_MB} MB"
+          [[ "${SIZE_MB}" -lt 800 ]] || {
+            echo "ERROR: Repo exceeds 800 MB (GitHub Pages 1 GB cap)"
+            exit 1
+          }
+
+      - name: Commit and push to gh-pages
+        run: |
+          cd repo/
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes — repo already up to date"
+          else
+            git commit -m "chore(repo): update RPMs $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git push origin gh-pages
+            echo "✓ Published to gh-pages"
+            echo "  URL: https://amanmulla3291.github.io/KrylixOS/repo/"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Smoke test (wait for CDN)
+        run: |
+          sleep 20
+          curl -fsSL --max-time 20 \
+            "https://amanmulla3291.github.io/KrylixOS/repo/repodata/repomd.xml" \
+            -o /dev/null && echo "✓ Repo accessible" || \
+            echo "⚠  Repo not yet reachable (CDN propagation — check in 2 min)"

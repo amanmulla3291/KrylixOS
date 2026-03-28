@@ -1,0 +1,155 @@
+# falco.te — KrylixOS SELinux Type Enforcement for Falco eBPF
+# Gap 1 Fix: required before any build work — without this, AVC storms guaranteed
+# Ships inside selinux-krylix-policy RPM as /usr/share/selinux/targeted/falco.te
+
+policy_module(falco, 1.0.0)
+
+########################################
+# Declarations
+########################################
+
+type falco_t;
+type falco_exec_t;
+init_daemon_domain(falco_t, falco_exec_t)
+
+type falco_var_log_t;
+logging_log_file(falco_var_log_t)
+
+type falco_var_run_t;
+files_pid_file(falco_var_run_t)
+
+type falco_conf_t;
+files_config_file(falco_conf_t)
+
+########################################
+# BPF — eBPF probe access (critical for Falco eBPF driver)
+########################################
+
+allow falco_t self:bpf {
+    map_create
+    map_read
+    map_write
+    prog_load
+    prog_run
+};
+
+# Kernel BPF capabilities
+allow falco_t self:capability {
+    sys_admin
+    sys_ptrace
+    net_admin
+    dac_read_search
+};
+
+allow falco_t self:capability2 {
+    bpf
+    perfmon
+};
+
+########################################
+# Kernel / tracefs access (perf ring buffer, kprobes, tracepoints)
+########################################
+
+allow falco_t kernel_t:system {
+    ipc_info
+    syslog_read
+};
+
+# tracefs: /sys/kernel/debug/tracing
+allow falco_t tracefs_t:dir  { open read search getattr };
+allow falco_t tracefs_t:file { open read getattr };
+
+# debugfs: /sys/kernel/debug
+allow falco_t debugfs_t:dir  { open read search getattr };
+allow falco_t debugfs_t:file { open read getattr };
+
+# sysfs: /sys/kernel/btf/* for BTF-based CO-RE
+allow falco_t sysfs_t:dir  { open read search getattr };
+allow falco_t sysfs_t:file { open read getattr };
+
+########################################
+# Proc access — /proc/*/maps, /proc/*/exe for process inspection
+########################################
+
+allow falco_t proc_t:dir    { read search };
+allow falco_t proc_t:file   { open read getattr };
+allow falco_t proc_t:lnk_file { read getattr };
+
+kernel_read_system_state(falco_t)
+kernel_read_kernel_sysctls(falco_t)
+
+########################################
+# perf_event — perf ring buffer (primary event source)
+########################################
+
+allow falco_t self:perf_event {
+    open
+    cpu
+    kernel
+    tracepoint
+    read
+    write
+};
+
+########################################
+# Network — Falco gRPC output (falco.yaml output.grpc)
+########################################
+
+allow falco_t self:tcp_socket {
+    create
+    connect
+    getattr
+    read
+    write
+    shutdown
+};
+allow falco_t self:unix_stream_socket create_stream_socket_perms;
+
+corenet_tcp_connect_all_ports(falco_t)
+
+########################################
+# Logging — journald / direct log file
+########################################
+
+allow falco_t falco_var_log_t:file { create open read write append getattr setattr };
+allow falco_t falco_var_log_t:dir  { write add_name };
+
+logging_send_syslog_msg(falco_t)
+
+########################################
+# PID file
+########################################
+
+allow falco_t falco_var_run_t:file { create open read write getattr setattr };
+allow falco_t falco_var_run_t:dir  { write add_name };
+
+########################################
+# Config files — /etc/falco/
+########################################
+
+allow falco_t falco_conf_t:file { open read getattr };
+allow falco_t falco_conf_t:dir  { open read search getattr };
+
+########################################
+# Falco needs to inspect all running processes (syscall monitoring)
+# Allow read of all domain process info — read-only, no ptrace write
+########################################
+
+allow falco_t domain:dir    { read search getattr };
+allow falco_t domain:file   { open read getattr };
+allow falco_t domain:lnk_file { read getattr };
+
+########################################
+# Signal handling from systemd
+########################################
+
+allow falco_t self:process {
+    fork
+    signal
+    sigchld
+    sigkill
+    sigstop
+};
+
+init_use_fds(falco_t)
+term_dontaudit_use_console(falco_t)

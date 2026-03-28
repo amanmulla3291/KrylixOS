@@ -1,0 +1,121 @@
+name: Build Kernel
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'kernel/**'
+      - '.github/workflows/build-kernel.yml'
+  schedule:
+    # Monthly: 1st of month, 02:00 UTC — check for new 6.12.y releases
+    - cron: '0 2 1 * *'
+  workflow_dispatch:
+
+# Principle of least privilege
+permissions:
+  contents: read
+
+# ── Signing key setup ────────────────────────────────────────────────────────
+# GitHub Secrets required (Settings → Secrets → Actions):
+#
+#   MOK_PRIVATE_KEY_PEM  — PEM-encoded RSA/EC private key (generate once, see README)
+#   MOK_CERT_PEM         — PEM-encoded X.509 public certificate matching the key
+#
+# Generate with:
+#   openssl req -newkey rsa:4096 -nodes -keyout mok.key -new -x509 -sha256 \
+#     -days 3650 -subj "/CN=KrylixOS MOK Key/" -out mok.cer
+#   cat mok.key   → paste as MOK_PRIVATE_KEY_PEM secret
+#   cat mok.cer   → paste as MOK_CERT_PEM secret
+#
+# Future hardening: migrate to OIDC + Vault when you have a dedicated server.
+# ─────────────────────────────────────────────────────────────────────────────
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+      options: --privileged   # required for kernel build + module signing
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          dnf install -y \
+            gcc gcc-c++ make flex bison \
+            openssl openssl-devel \
+            elfutils-libelf-devel libelf-devel \
+            bc perl xz \
+            dwarves pahole \
+            python3 python3-devel \
+            rpm-build rpmsign rpmdevtools \
+            pesign sbsigntools \
+            curl jq gpg git \
+            dnf5 dnf5-plugins
+
+      - name: Set SOURCE_DATE_EPOCH (reproducible builds)
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "${GITHUB_ENV}"
+
+      - name: Install MOK certificate
+        # Certificate is public — safe to write to disk
+        run: |
+          mkdir -p /etc/pki/krylix
+          printf '%s' "${{ secrets.MOK_CERT_PEM }}" > /etc/pki/krylix/KrylixOS-ca.cer
+          chmod 644 /etc/pki/krylix/KrylixOS-ca.cer
+          echo "MOK cert installed."
+
+      - name: Verify secrets are present
+        run: |
+          if [[ -z "${{ secrets.MOK_PRIVATE_KEY_PEM }}" ]]; then
+            echo "⚠  MOK_PRIVATE_KEY_PEM not set — kernel will be UNSIGNED (local dev mode)"
+            echo "   Add the secret in: Settings → Secrets → Actions → New repository secret"
+          fi
+          if [[ -z "${{ secrets.MOK_CERT_PEM }}" ]]; then
+            echo "⚠  MOK_CERT_PEM not set — kernel signing will be skipped"
+          fi
+
+      - name: Set up rpmbuild tree
+        run: rpmdev-setuptree
+
+      - name: Build kernel
+        run: |
+          chmod +x kernel/build-kernel.sh
+          kernel/build-kernel.sh
+        env:
+          MOK_PRIVATE_KEY_PEM: ${{ secrets.MOK_PRIVATE_KEY_PEM }}
+          SOURCE_DATE_EPOCH:   ${{ env.SOURCE_DATE_EPOCH }}
+
+      - name: Verify kernel signature (if cert available)
+        run: |
+          KVER_RPM=$(ls ~/rpmbuild/RPMS/x86_64/kernel-krylix-*.rpm 2>/dev/null | head -1 || echo "")
+          if [[ -z "${KVER_RPM}" ]]; then
+            echo "No kernel RPM found — skipping signature check"
+            exit 0
+          fi
+
+          CERT="/etc/pki/krylix/KrylixOS-ca.cer"
+          VMLINUZ=$(rpm -qlp "${KVER_RPM}" 2>/dev/null | grep "^/boot/vmlinuz" | head -1 || echo "")
+
+          if [[ -f "${CERT}" && -n "${VMLINUZ}" ]]; then
+            rpm2cpio "${KVER_RPM}" | cpio -idmv ".${VMLINUZ}" 2>/dev/null || true
+            VMLINUZ_LOCAL=".${VMLINUZ}"
+            if [[ -f "${VMLINUZ_LOCAL}" ]]; then
+              sbverify --cert "${CERT}" "${VMLINUZ_LOCAL}" && \
+                echo "✓ Kernel signature verified" || \
+                echo "⚠  sbverify failed — check signing step"
+            fi
+          else
+            echo "⚠  Cert or vmlinuz not found — skipping sbverify"
+          fi
+
+      - name: Upload kernel RPM
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-krylix-rpm
+          path: ~/rpmbuild/RPMS/x86_64/kernel-krylix-*.rpm
+          retention-days: 14
+          if-no-files-found: warn
